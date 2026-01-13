@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const prisma = require('../db');
+const { db, toCamelCase, rowsToCamelCase } = require('../db');
 
 // Validation middleware
 const vendorValidation = [
@@ -17,29 +17,29 @@ router.get('/', async (req, res, next) => {
   try {
     const { search, isActive, sortBy = 'name', order = 'asc' } = req.query;
 
-    const where = {};
+    let sql = `
+      SELECT v.*,
+        (SELECT COUNT(*) FROM parts WHERE vendor_id = v.id) as parts_count,
+        (SELECT COUNT(*) FROM orders WHERE vendor_id = v.id) as orders_count
+      FROM vendors v
+      WHERE 1=1
+    `;
+    const params = [];
+
     if (search) {
-      where.OR = [
-        { name: { contains: search } },
-        { code: { contains: search } },
-        { email: { contains: search } },
-      ];
+      sql += ` AND (v.name LIKE ? OR v.code LIKE ? OR v.email LIKE ?)`;
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
     }
     if (isActive !== undefined) {
-      where.isActive = isActive === 'true';
+      sql += ` AND v.is_active = ?`;
+      params.push(isActive === 'true' ? 1 : 0);
     }
 
-    const vendors = await prisma.vendor.findMany({
-      where,
-      orderBy: { [sortBy]: order },
-      include: {
-        _count: {
-          select: { parts: true, orders: true }
-        }
-      }
-    });
+    const sortColumn = sortBy === 'name' ? 'v.name' : `v.${sortBy.replace(/([A-Z])/g, '_$1').toLowerCase()}`;
+    sql += ` ORDER BY ${sortColumn} ${order.toUpperCase()}`;
 
-    res.json(vendors);
+    const vendors = db.prepare(sql).all(...params);
+    res.json(rowsToCamelCase(vendors));
   } catch (error) {
     next(error);
   }
@@ -48,29 +48,33 @@ router.get('/', async (req, res, next) => {
 // GET /api/vendors/:id - Get vendor by ID
 router.get('/:id', async (req, res, next) => {
   try {
-    const vendor = await prisma.vendor.findUnique({
-      where: { id: parseInt(req.params.id) },
-      include: {
-        parts: {
-          include: {
-            inventory: true
-          }
-        },
-        orders: {
-          orderBy: { createdAt: 'desc' },
-          take: 10
-        },
-        _count: {
-          select: { parts: true, orders: true }
-        }
-      }
-    });
+    const vendor = db.prepare(`
+      SELECT v.*,
+        (SELECT COUNT(*) FROM parts WHERE vendor_id = v.id) as parts_count,
+        (SELECT COUNT(*) FROM orders WHERE vendor_id = v.id) as orders_count
+      FROM vendors v WHERE v.id = ?
+    `).get(parseInt(req.params.id));
 
     if (!vendor) {
       return res.status(404).json({ error: 'Vendor not found' });
     }
 
-    res.json(vendor);
+    const parts = db.prepare(`
+      SELECT p.*, i.quantity_on_hand, i.reorder_point
+      FROM parts p
+      LEFT JOIN inventory i ON i.part_id = p.id
+      WHERE p.vendor_id = ?
+    `).all(vendor.id);
+
+    const orders = db.prepare(`
+      SELECT * FROM orders WHERE vendor_id = ? ORDER BY created_at DESC LIMIT 10
+    `).all(vendor.id);
+
+    const result = toCamelCase(vendor);
+    result.parts = rowsToCamelCase(parts);
+    result.orders = rowsToCamelCase(orders);
+
+    res.json(result);
   } catch (error) {
     next(error);
   }
@@ -84,13 +88,24 @@ router.post('/', vendorValidation, async (req, res, next) => {
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const vendor = await prisma.vendor.create({
-      data: req.body
-    });
+    const { name, code, contactName, email, phone, address, city, state, zipCode, country, website, notes, isActive, rating, leadTimeDays } = req.body;
 
-    res.status(201).json(vendor);
+    const stmt = db.prepare(`
+      INSERT INTO vendors (name, code, contact_name, email, phone, address, city, state, zip_code, country, website, notes, is_active, rating, lead_time_days)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const result = stmt.run(
+      name, code, contactName || null, email || null, phone || null,
+      address || null, city || null, state || null, zipCode || null,
+      country || 'USA', website || null, notes || null,
+      isActive !== false ? 1 : 0, rating || 0, leadTimeDays || 7
+    );
+
+    const vendor = db.prepare('SELECT * FROM vendors WHERE id = ?').get(result.lastInsertRowid);
+    res.status(201).json(toCamelCase(vendor));
   } catch (error) {
-    if (error.code === 'P2002') {
+    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
       return res.status(400).json({ error: 'Vendor code already exists' });
     }
     next(error);
@@ -105,17 +120,32 @@ router.put('/:id', vendorValidation, async (req, res, next) => {
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const vendor = await prisma.vendor.update({
-      where: { id: parseInt(req.params.id) },
-      data: req.body
-    });
-
-    res.json(vendor);
-  } catch (error) {
-    if (error.code === 'P2025') {
+    const id = parseInt(req.params.id);
+    const existing = db.prepare('SELECT * FROM vendors WHERE id = ?').get(id);
+    if (!existing) {
       return res.status(404).json({ error: 'Vendor not found' });
     }
-    if (error.code === 'P2002') {
+
+    const { name, code, contactName, email, phone, address, city, state, zipCode, country, website, notes, isActive, rating, leadTimeDays } = req.body;
+
+    db.prepare(`
+      UPDATE vendors SET
+        name = ?, code = ?, contact_name = ?, email = ?, phone = ?,
+        address = ?, city = ?, state = ?, zip_code = ?, country = ?,
+        website = ?, notes = ?, is_active = ?, rating = ?, lead_time_days = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(
+      name, code, contactName || null, email || null, phone || null,
+      address || null, city || null, state || null, zipCode || null,
+      country || 'USA', website || null, notes || null,
+      isActive !== false ? 1 : 0, rating || 0, leadTimeDays || 7, id
+    );
+
+    const vendor = db.prepare('SELECT * FROM vendors WHERE id = ?').get(id);
+    res.json(toCamelCase(vendor));
+  } catch (error) {
+    if (error.code === 'SQLITE_CONSTRAINT_UNIQUE') {
       return res.status(400).json({ error: 'Vendor code already exists' });
     }
     next(error);
@@ -125,15 +155,15 @@ router.put('/:id', vendorValidation, async (req, res, next) => {
 // DELETE /api/vendors/:id - Delete vendor
 router.delete('/:id', async (req, res, next) => {
   try {
-    await prisma.vendor.delete({
-      where: { id: parseInt(req.params.id) }
-    });
-
-    res.json({ message: 'Vendor deleted successfully' });
-  } catch (error) {
-    if (error.code === 'P2025') {
+    const id = parseInt(req.params.id);
+    const existing = db.prepare('SELECT * FROM vendors WHERE id = ?').get(id);
+    if (!existing) {
       return res.status(404).json({ error: 'Vendor not found' });
     }
+
+    db.prepare('DELETE FROM vendors WHERE id = ?').run(id);
+    res.json({ message: 'Vendor deleted successfully' });
+  } catch (error) {
     next(error);
   }
 });
@@ -141,20 +171,18 @@ router.delete('/:id', async (req, res, next) => {
 // PATCH /api/vendors/:id/toggle-active - Toggle vendor active status
 router.patch('/:id/toggle-active', async (req, res, next) => {
   try {
-    const vendor = await prisma.vendor.findUnique({
-      where: { id: parseInt(req.params.id) }
-    });
+    const id = parseInt(req.params.id);
+    const vendor = db.prepare('SELECT * FROM vendors WHERE id = ?').get(id);
 
     if (!vendor) {
       return res.status(404).json({ error: 'Vendor not found' });
     }
 
-    const updated = await prisma.vendor.update({
-      where: { id: parseInt(req.params.id) },
-      data: { isActive: !vendor.isActive }
-    });
+    db.prepare('UPDATE vendors SET is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+      .run(vendor.is_active ? 0 : 1, id);
 
-    res.json(updated);
+    const updated = db.prepare('SELECT * FROM vendors WHERE id = ?').get(id);
+    res.json(toCamelCase(updated));
   } catch (error) {
     next(error);
   }

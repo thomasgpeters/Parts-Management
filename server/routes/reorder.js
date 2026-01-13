@@ -1,23 +1,25 @@
 const express = require('express');
 const router = express.Router();
-const prisma = require('../db');
-const { checkAndCreateReorderAlerts, processReorderAlert } = require('../services/autoReorder');
+const { db, toCamelCase, rowsToCamelCase } = require('../db');
 
 // GET /api/reorder/alerts - Get all reorder alerts
 router.get('/alerts', async (req, res, next) => {
   try {
     const { status, limit = 50 } = req.query;
 
-    const where = {};
-    if (status) where.status = status;
+    let sql = 'SELECT * FROM reorder_alerts WHERE 1=1';
+    const params = [];
 
-    const alerts = await prisma.reorderAlert.findMany({
-      where,
-      orderBy: { createdAt: 'desc' },
-      take: parseInt(limit)
-    });
+    if (status) {
+      sql += ' AND status = ?';
+      params.push(status);
+    }
 
-    res.json(alerts);
+    sql += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(parseInt(limit));
+
+    const alerts = db.prepare(sql).all(...params);
+    res.json(rowsToCamelCase(alerts));
   } catch (error) {
     next(error);
   }
@@ -26,16 +28,10 @@ router.get('/alerts', async (req, res, next) => {
 // GET /api/reorder/alerts/pending - Get pending alerts count
 router.get('/alerts/pending', async (req, res, next) => {
   try {
-    const count = await prisma.reorderAlert.count({
-      where: { status: 'PENDING' }
-    });
+    const count = db.prepare("SELECT COUNT(*) as count FROM reorder_alerts WHERE status = 'PENDING'").get();
+    const alerts = db.prepare("SELECT * FROM reorder_alerts WHERE status = 'PENDING' ORDER BY created_at DESC").all();
 
-    const alerts = await prisma.reorderAlert.findMany({
-      where: { status: 'PENDING' },
-      orderBy: { createdAt: 'desc' }
-    });
-
-    res.json({ count, alerts });
+    res.json({ count: count.count, alerts: rowsToCamelCase(alerts) });
   } catch (error) {
     next(error);
   }
@@ -44,10 +40,37 @@ router.get('/alerts/pending', async (req, res, next) => {
 // POST /api/reorder/check - Manually trigger reorder check
 router.post('/check', async (req, res, next) => {
   try {
-    const alerts = await checkAndCreateReorderAlerts();
+    const inventory = db.prepare(`
+      SELECT i.*, p.part_number, p.name as part_name, p.vendor_id, v.name as vendor_name
+      FROM inventory i
+      JOIN parts p ON p.id = i.part_id
+      LEFT JOIN vendors v ON v.id = p.vendor_id
+      WHERE p.is_active = 1
+    `).all();
+
+    const newAlerts = [];
+
+    for (const item of inventory) {
+      if (item.quantity_on_hand <= item.reorder_point) {
+        const existing = db.prepare(`
+          SELECT * FROM reorder_alerts WHERE part_id = ? AND status = 'PENDING'
+        `).get(item.part_id);
+
+        if (!existing) {
+          const result = db.prepare(`
+            INSERT INTO reorder_alerts (part_id, part_number, part_name, current_qty, reorder_point, reorder_qty, vendor_id, vendor_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(item.part_id, item.part_number, item.part_name, item.quantity_on_hand, item.reorder_point, item.reorder_quantity, item.vendor_id, item.vendor_name);
+
+          const alert = db.prepare('SELECT * FROM reorder_alerts WHERE id = ?').get(result.lastInsertRowid);
+          newAlerts.push(toCamelCase(alert));
+        }
+      }
+    }
+
     res.json({
-      message: `Created ${alerts.length} new reorder alerts`,
-      alerts
+      message: `Created ${newAlerts.length} new reorder alerts`,
+      alerts: newAlerts
     });
   } catch (error) {
     next(error);
@@ -58,13 +81,78 @@ router.post('/check', async (req, res, next) => {
 router.post('/alerts/:id/process', async (req, res, next) => {
   try {
     const alertId = parseInt(req.params.id);
-    const result = await processReorderAlert(alertId);
+    const alert = db.prepare('SELECT * FROM reorder_alerts WHERE id = ?').get(alertId);
 
-    if (!result.success) {
-      return res.status(400).json({ error: result.error });
+    if (!alert) {
+      return res.status(404).json({ error: 'Alert not found' });
     }
 
-    res.json(result);
+    if (alert.status !== 'PENDING') {
+      return res.status(400).json({ error: 'Alert is not pending' });
+    }
+
+    if (!alert.vendor_id) {
+      return res.status(400).json({ error: 'No vendor assigned to this part' });
+    }
+
+    const part = db.prepare('SELECT * FROM parts WHERE id = ?').get(alert.part_id);
+    if (!part) {
+      return res.status(400).json({ error: 'Part not found' });
+    }
+
+    // Generate order number
+    const date = new Date();
+    const prefix = `PO${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}`;
+    const lastOrder = db.prepare(`
+      SELECT order_number FROM orders WHERE order_number LIKE ? ORDER BY order_number DESC LIMIT 1
+    `).get(`${prefix}%`);
+
+    let sequence = 1;
+    if (lastOrder) {
+      sequence = parseInt(lastOrder.order_number.slice(-4)) + 1;
+    }
+    const orderNumber = `${prefix}${String(sequence).padStart(4, '0')}`;
+    const totalPrice = alert.reorder_qty * part.unit_price;
+
+    const createOrder = db.transaction(() => {
+      const orderResult = db.prepare(`
+        INSERT INTO orders (order_number, vendor_id, status, is_auto_generated, subtotal, total, notes)
+        VALUES (?, ?, 'PENDING', 1, ?, ?, ?)
+      `).run(orderNumber, alert.vendor_id, totalPrice, totalPrice, `Auto-generated from reorder alert #${alertId}`);
+
+      const orderId = orderResult.lastInsertRowid;
+
+      db.prepare(`
+        INSERT INTO order_items (order_id, part_id, quantity, unit_price, total_price)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(orderId, alert.part_id, alert.reorder_qty, part.unit_price, totalPrice);
+
+      db.prepare(`
+        UPDATE reorder_alerts SET status = 'ORDERED', order_id = ?, processed_at = CURRENT_TIMESTAMP WHERE id = ?
+      `).run(orderId, alertId);
+
+      return orderId;
+    });
+
+    const orderId = createOrder();
+
+    const order = db.prepare(`
+      SELECT o.*, v.name as vendor_name FROM orders o
+      JOIN vendors v ON v.id = o.vendor_id WHERE o.id = ?
+    `).get(orderId);
+    const items = db.prepare(`
+      SELECT oi.*, p.part_number, p.name as part_name FROM order_items oi
+      JOIN parts p ON p.id = oi.part_id WHERE oi.order_id = ?
+    `).all(orderId);
+
+    res.json({
+      success: true,
+      order: {
+        ...toCamelCase(order),
+        vendor: { id: order.vendor_id, name: order.vendor_name },
+        items: rowsToCamelCase(items)
+      }
+    });
   } catch (error) {
     next(error);
   }
@@ -73,19 +161,20 @@ router.post('/alerts/:id/process', async (req, res, next) => {
 // POST /api/reorder/alerts/:id/dismiss - Dismiss a reorder alert
 router.post('/alerts/:id/dismiss', async (req, res, next) => {
   try {
-    const alert = await prisma.reorderAlert.update({
-      where: { id: parseInt(req.params.id) },
-      data: {
-        status: 'DISMISSED',
-        processedAt: new Date()
-      }
-    });
+    const alertId = parseInt(req.params.id);
+    const existing = db.prepare('SELECT * FROM reorder_alerts WHERE id = ?').get(alertId);
 
-    res.json(alert);
-  } catch (error) {
-    if (error.code === 'P2025') {
+    if (!existing) {
       return res.status(404).json({ error: 'Alert not found' });
     }
+
+    db.prepare(`
+      UPDATE reorder_alerts SET status = 'DISMISSED', processed_at = CURRENT_TIMESTAMP WHERE id = ?
+    `).run(alertId);
+
+    const alert = db.prepare('SELECT * FROM reorder_alerts WHERE id = ?').get(alertId);
+    res.json(toCamelCase(alert));
+  } catch (error) {
     next(error);
   }
 });
@@ -93,18 +182,56 @@ router.post('/alerts/:id/dismiss', async (req, res, next) => {
 // POST /api/reorder/process-all - Process all pending alerts
 router.post('/process-all', async (req, res, next) => {
   try {
-    const pendingAlerts = await prisma.reorderAlert.findMany({
-      where: { status: 'PENDING' }
-    });
+    const pendingAlerts = db.prepare("SELECT * FROM reorder_alerts WHERE status = 'PENDING'").all();
 
     const results = [];
     for (const alert of pendingAlerts) {
-      const result = await processReorderAlert(alert.id);
-      results.push({
-        alertId: alert.id,
-        partNumber: alert.partNumber,
-        ...result
+      if (!alert.vendor_id) {
+        results.push({ alertId: alert.id, partNumber: alert.part_number, success: false, error: 'No vendor' });
+        continue;
+      }
+
+      const part = db.prepare('SELECT * FROM parts WHERE id = ?').get(alert.part_id);
+      if (!part) {
+        results.push({ alertId: alert.id, partNumber: alert.part_number, success: false, error: 'Part not found' });
+        continue;
+      }
+
+      const date = new Date();
+      const prefix = `PO${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}`;
+      const lastOrder = db.prepare(`
+        SELECT order_number FROM orders WHERE order_number LIKE ? ORDER BY order_number DESC LIMIT 1
+      `).get(`${prefix}%`);
+
+      let sequence = 1;
+      if (lastOrder) {
+        sequence = parseInt(lastOrder.order_number.slice(-4)) + 1;
+      }
+      const orderNumber = `${prefix}${String(sequence).padStart(4, '0')}`;
+      const totalPrice = alert.reorder_qty * part.unit_price;
+
+      const createOrder = db.transaction(() => {
+        const orderResult = db.prepare(`
+          INSERT INTO orders (order_number, vendor_id, status, is_auto_generated, subtotal, total, notes)
+          VALUES (?, ?, 'PENDING', 1, ?, ?, ?)
+        `).run(orderNumber, alert.vendor_id, totalPrice, totalPrice, `Auto-generated from reorder alert #${alert.id}`);
+
+        const orderId = orderResult.lastInsertRowid;
+
+        db.prepare(`
+          INSERT INTO order_items (order_id, part_id, quantity, unit_price, total_price)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(orderId, alert.part_id, alert.reorder_qty, part.unit_price, totalPrice);
+
+        db.prepare(`
+          UPDATE reorder_alerts SET status = 'ORDERED', order_id = ?, processed_at = CURRENT_TIMESTAMP WHERE id = ?
+        `).run(orderId, alert.id);
+
+        return orderId;
       });
+
+      createOrder();
+      results.push({ alertId: alert.id, partNumber: alert.part_number, success: true });
     }
 
     const successful = results.filter(r => r.success).length;
@@ -119,37 +246,34 @@ router.post('/process-all', async (req, res, next) => {
   }
 });
 
-// GET /api/reorder/suggestions - Get reorder suggestions (items below reorder point)
+// GET /api/reorder/suggestions - Get reorder suggestions
 router.get('/suggestions', async (req, res, next) => {
   try {
-    const inventory = await prisma.inventory.findMany({
-      include: {
-        part: {
-          include: {
-            vendor: true
-          }
-        }
-      }
-    });
+    const inventory = db.prepare(`
+      SELECT i.*, p.part_number, p.name as part_name, p.unit_price, p.vendor_id, p.is_active,
+        v.name as vendor_name, v.lead_time_days
+      FROM inventory i
+      JOIN parts p ON p.id = i.part_id
+      LEFT JOIN vendors v ON v.id = p.vendor_id
+    `).all();
 
     const suggestions = inventory
-      .filter(i => i.quantityOnHand <= i.reorderPoint && i.part?.isActive)
+      .filter(i => i.quantity_on_hand <= i.reorder_point && i.is_active)
       .map(i => ({
-        partId: i.partId,
-        partNumber: i.part?.partNumber,
-        partName: i.part?.name,
-        vendorId: i.part?.vendorId,
-        vendorName: i.part?.vendor?.name,
-        currentQuantity: i.quantityOnHand,
-        reorderPoint: i.reorderPoint,
-        reorderQuantity: i.reorderQuantity,
-        shortfall: i.reorderPoint - i.quantityOnHand,
-        estimatedCost: i.reorderQuantity * (i.part?.unitPrice || 0),
-        leadTimeDays: i.part?.vendor?.leadTimeDays || 7
+        partId: i.part_id,
+        partNumber: i.part_number,
+        partName: i.part_name,
+        vendorId: i.vendor_id,
+        vendorName: i.vendor_name,
+        currentQuantity: i.quantity_on_hand,
+        reorderPoint: i.reorder_point,
+        reorderQuantity: i.reorder_quantity,
+        shortfall: i.reorder_point - i.quantity_on_hand,
+        estimatedCost: i.reorder_quantity * (i.unit_price || 0),
+        leadTimeDays: i.lead_time_days || 7
       }))
       .sort((a, b) => b.shortfall - a.shortfall);
 
-    // Group by vendor for bulk ordering
     const byVendor = {};
     suggestions.forEach(s => {
       if (!s.vendorId) return;
@@ -182,81 +306,82 @@ router.get('/suggestions', async (req, res, next) => {
 // POST /api/reorder/create-orders - Create orders from suggestions
 router.post('/create-orders', async (req, res, next) => {
   try {
-    const { vendorIds } = req.body; // Optional: specific vendors to create orders for
+    const { vendorIds } = req.body;
 
-    const inventory = await prisma.inventory.findMany({
-      include: {
-        part: {
-          include: { vendor: true }
-        }
-      }
-    });
+    const inventory = db.prepare(`
+      SELECT i.*, p.part_number, p.name as part_name, p.unit_price, p.vendor_id, p.is_active,
+        v.name as vendor_name
+      FROM inventory i
+      JOIN parts p ON p.id = i.part_id
+      LEFT JOIN vendors v ON v.id = p.vendor_id
+      WHERE i.quantity_on_hand <= i.reorder_point AND p.is_active = 1 AND p.vendor_id IS NOT NULL
+    `).all();
 
     const lowStockByVendor = {};
-    inventory
-      .filter(i => i.quantityOnHand <= i.reorderPoint && i.part?.isActive && i.part?.vendorId)
-      .forEach(i => {
-        const vendorId = i.part.vendorId;
-        if (vendorIds && !vendorIds.includes(vendorId)) return;
+    inventory.forEach(i => {
+      if (vendorIds && !vendorIds.includes(i.vendor_id)) return;
 
-        if (!lowStockByVendor[vendorId]) {
-          lowStockByVendor[vendorId] = {
-            vendor: i.part.vendor,
-            items: []
-          };
-        }
-        lowStockByVendor[vendorId].items.push({
-          partId: i.partId,
-          quantity: i.reorderQuantity,
-          unitPrice: i.part.unitPrice
-        });
+      if (!lowStockByVendor[i.vendor_id]) {
+        lowStockByVendor[i.vendor_id] = {
+          vendorName: i.vendor_name,
+          items: []
+        };
+      }
+      lowStockByVendor[i.vendor_id].items.push({
+        partId: i.part_id,
+        quantity: i.reorder_quantity,
+        unitPrice: i.unit_price
       });
+    });
 
     const createdOrders = [];
-    for (const vendorId of Object.keys(lowStockByVendor)) {
-      const { vendor, items } = lowStockByVendor[vendorId];
 
-      // Generate order number
+    for (const vendorId of Object.keys(lowStockByVendor)) {
+      const { vendorName, items } = lowStockByVendor[vendorId];
+
       const date = new Date();
       const prefix = `PO${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, '0')}`;
-      const lastOrder = await prisma.order.findFirst({
-        where: { orderNumber: { startsWith: prefix } },
-        orderBy: { orderNumber: 'desc' }
-      });
+      const lastOrder = db.prepare(`
+        SELECT order_number FROM orders WHERE order_number LIKE ? ORDER BY order_number DESC LIMIT 1
+      `).get(`${prefix}%`);
+
       let sequence = 1;
       if (lastOrder) {
-        sequence = parseInt(lastOrder.orderNumber.slice(-4)) + 1;
+        sequence = parseInt(lastOrder.order_number.slice(-4)) + 1;
       }
       const orderNumber = `${prefix}${String(sequence).padStart(4, '0')}`;
 
       const orderItems = items.map(item => ({
-        partId: item.partId,
-        quantity: item.quantity,
-        unitPrice: item.unitPrice,
+        ...item,
         totalPrice: item.quantity * item.unitPrice
       }));
 
       const subtotal = orderItems.reduce((sum, i) => sum + i.totalPrice, 0);
 
-      const order = await prisma.order.create({
-        data: {
-          orderNumber,
-          vendorId: parseInt(vendorId),
-          status: 'PENDING',
-          isAutoGenerated: true,
-          subtotal,
-          total: subtotal,
-          items: {
-            create: orderItems
-          }
-        },
-        include: {
-          vendor: true,
-          items: { include: { part: true } }
+      const createOrder = db.transaction(() => {
+        const orderResult = db.prepare(`
+          INSERT INTO orders (order_number, vendor_id, status, is_auto_generated, subtotal, total)
+          VALUES (?, ?, 'PENDING', 1, ?, ?)
+        `).run(orderNumber, parseInt(vendorId), subtotal, subtotal);
+
+        const orderId = orderResult.lastInsertRowid;
+
+        for (const item of orderItems) {
+          db.prepare(`
+            INSERT INTO order_items (order_id, part_id, quantity, unit_price, total_price)
+            VALUES (?, ?, ?, ?, ?)
+          `).run(orderId, item.partId, item.quantity, item.unitPrice, item.totalPrice);
         }
+
+        return orderId;
       });
 
-      createdOrders.push(order);
+      const orderId = createOrder();
+      const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(orderId);
+      createdOrders.push({
+        ...toCamelCase(order),
+        vendor: { id: parseInt(vendorId), name: vendorName }
+      });
     }
 
     res.json({
